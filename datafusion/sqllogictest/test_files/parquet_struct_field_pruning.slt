@@ -490,9 +490,9 @@ LOCATION 'test_files/scratch/parquet_struct_field_pruning/placeholder/f.parquet'
 query I
 SELECT count(*) FROM placeholder WHERE "__datafusion_pruning_stats_expr_0" = 99 AND s['a'] > 0;
 ----
-0
+1
 
 query I
 SELECT count(*) FROM placeholder WHERE s['a'] > 0 AND "__datafusion_pruning_stats_expr_0" IN (99, 100);
 ----
-0
+1

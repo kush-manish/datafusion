@@ -885,7 +885,12 @@ fn analyze_literal_guarantees(
     matcher: Option<&dyn StatisticsExprMatcher>,
     schema: &Schema,
 ) -> (Vec<LiteralGuarantee>, Vec<ExprLiteralGuarantee>) {
-    if matcher.is_none() {
+    // A real column with a placeholder name would be mistaken for a key.
+    if matcher.is_none()
+        || collect_columns(predicate)
+            .iter()
+            .any(|c| c.name().starts_with(STATS_EXPR_PLACEHOLDER))
+    {
         return (LiteralGuarantee::analyze(predicate), vec![]);
     }
     let mut keys: Vec<Arc<dyn PhysicalExpr>> = vec![];
