@@ -1540,21 +1540,26 @@ fn reverse_operator(op: Operator) -> Result<Operator> {
 /// if the column may contain values, and false if definitely does not
 /// contain values
 fn build_single_column_expr(
-    column: &phys_expr::Column,
+    key: &StatsKey,
     schema: &Schema,
     required_columns: &mut RequiredColumns,
     is_not: bool, // if true, treat as !col
 ) -> Option<Arc<dyn PhysicalExpr>> {
-    let field = schema.field_with_name(column.name()).ok()?;
+    // The type of the expression, not of its root column: a boolean struct
+    // field has a struct root.
+    let field = match &key.expr {
+        None => schema.field_with_name(key.column.name()).ok()?.clone(),
+        Some(expr) => Field::new(expr.to_string(), expr.data_type(schema).ok()?, true),
+    };
 
     if *field.data_type() == DataType::Boolean {
-        let col_ref = Arc::new(column.clone()) as _;
+        let key_expr = key.to_expr();
 
         let min = required_columns
-            .min_column_expr(column, &col_ref, field)
+            .stat_key_expr(key, &key_expr, &field, StatisticsType::Min)
             .ok()?;
         let max = required_columns
-            .max_column_expr(column, &col_ref, field)
+            .stat_key_expr(key, &key_expr, &field, StatisticsType::Max)
             .ok()?;
 
         // remember -- we want an expression that is:
@@ -1963,14 +1968,16 @@ fn build_predicate_expression(
         )
         .unwrap_or_else(|| ctx.unhandled_hook.handle(expr));
     }
-    if let Some(col) = expr.downcast_ref::<phys_expr::Column>() {
-        return build_single_column_expr(col, ctx.schema, required_columns, false)
+    if let Some(key) = as_stats_key(expr, ctx.statistics_expr_matcher, ctx.schema) {
+        return build_single_column_expr(&key, ctx.schema, required_columns, false)
             .unwrap_or_else(|| ctx.unhandled_hook.handle(expr));
     }
     if let Some(not) = expr.downcast_ref::<phys_expr::NotExpr>() {
         // match !col (don't do so recursively)
-        if let Some(col) = not.arg().downcast_ref::<phys_expr::Column>() {
-            return build_single_column_expr(col, ctx.schema, required_columns, true)
+        if let Some(key) =
+            as_stats_key(not.arg(), ctx.statistics_expr_matcher, ctx.schema)
+        {
+            return build_single_column_expr(&key, ctx.schema, required_columns, true)
                 .unwrap_or_else(|| ctx.unhandled_hook.handle(expr));
         } else {
             return ctx.unhandled_hook.handle(expr);
@@ -7770,6 +7777,7 @@ mod tests {
             vec![
                 Field::new("a", DataType::Int32, true),
                 Field::new("b", DataType::Int32, true),
+                Field::new("flag", DataType::Boolean, true),
             ]
             .into(),
         );
@@ -7834,6 +7842,22 @@ mod tests {
             predicate.predicate_expr().to_string(),
             "get_field(s@0, a)_null_count@1 != row_count@2 \
              AND CAST(get_field(s@0, a)_max@0 AS Float64;N) > 6.5"
+        );
+    }
+
+    #[test]
+    fn matched_boolean_expression() {
+        use datafusion_functions::core::expr_fn::get_field;
+        let flag = || get_field(col("s"), "flag");
+        let predicate = build_with_matcher(&flag(), true);
+        assert_eq!(
+            predicate.predicate_expr().to_string(),
+            "get_field(s@0, flag)_min@0 OR get_field(s@0, flag)_max@1"
+        );
+        let predicate = build_with_matcher(&flag().not(), true);
+        assert_eq!(
+            predicate.predicate_expr().to_string(),
+            "NOT get_field(s@0, flag)_min@0 OR NOT get_field(s@0, flag)_max@1"
         );
     }
 
