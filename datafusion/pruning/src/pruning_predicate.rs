@@ -1243,18 +1243,13 @@ impl<'a> PruningExpressionBuilder<'a> {
             }
         };
 
-        let (column_expr, correct_operator, scalar_expr) = if key.expr.as_ref()
-            == Some(column_expr)
-        {
-            // `expr op lit()` for an expression with its own statistics
-            (
-                Arc::clone(column_expr),
-                correct_operator,
-                Arc::clone(scalar_expr),
-            )
-        } else {
-            rewrite_expr_to_prunable(column_expr, correct_operator, scalar_expr, schema)?
-        };
+        let (column_expr, correct_operator, scalar_expr) = rewrite_expr_to_prunable(
+            column_expr,
+            correct_operator,
+            scalar_expr,
+            schema,
+            key.expr.as_ref(),
+        )?;
         let field = match &key.expr {
             None => {
                 let Some((_, field)) = schema.column_with_name(key.column.name()) else {
@@ -1359,13 +1354,15 @@ fn rewrite_expr_to_prunable(
     op: Operator,
     scalar_expr: &PhysicalExprRef,
     schema: &Schema,
+    key_expr: Option<&PhysicalExprRef>,
 ) -> Result<(PhysicalExprRef, Operator, PhysicalExprRef)> {
     if !is_compare_op(op) {
         return plan_err!("rewrite_expr_to_prunable only support compare expression");
     }
 
-    if column_expr.downcast_ref::<phys_expr::Column>().is_some() {
-        // `col op lit()`
+    if is_stats_leaf(column_expr, key_expr) {
+        // `col op lit()`, or `expr op lit()` for an expression with its own
+        // statistics
         Ok((Arc::clone(column_expr), op, Arc::clone(scalar_expr)))
     } else if let Some(cast) = column_expr.downcast_ref::<phys_expr::CastExpr>() {
         // `cast(col) op lit()`
@@ -1375,16 +1372,13 @@ fn rewrite_expr_to_prunable(
             op,
             scalar_expr,
             schema,
+            key_expr,
         )?;
         let left = Arc::new(phys_expr::CastExpr::new_with_target_field(
             left,
             Arc::clone(cast.target_field()),
             None,
         ));
-        // PruningPredicate does not support pruning on nested fields yet.
-        // End-to-end nested-field pruning also requires Parquet statistics
-        // extraction to agree with PruningPredicate on a stats representation
-        // for nested field expressions.
         Ok((left, op, right))
     } else if let Some(try_cast) = column_expr.downcast_ref::<phys_expr::TryCastExpr>() {
         // `try_cast(col) op lit()`
@@ -1394,6 +1388,7 @@ fn rewrite_expr_to_prunable(
             op,
             scalar_expr,
             schema,
+            key_expr,
         )?;
         let left = Arc::new(phys_expr::TryCastExpr::new(
             left,
@@ -1403,7 +1398,7 @@ fn rewrite_expr_to_prunable(
     } else if let Some(neg) = column_expr.downcast_ref::<phys_expr::NegativeExpr>() {
         // `-col > lit()`  --> `col < -lit()`
         let (left, op, right) =
-            rewrite_expr_to_prunable(neg.arg(), op, scalar_expr, schema)?;
+            rewrite_expr_to_prunable(neg.arg(), op, scalar_expr, schema, key_expr)?;
         let right = Arc::new(phys_expr::NegativeExpr::new(right));
         Ok((left, reverse_operator(op)?, right))
     } else if let Some(not) = column_expr.downcast_ref::<phys_expr::NotExpr>() {
@@ -1419,7 +1414,7 @@ fn rewrite_expr_to_prunable(
                 "Not with operator other than Eq / NotEq / IsDistinctFrom / IsNotDistinctFrom is not supported"
             );
         }
-        if not.arg().downcast_ref::<phys_expr::Column>().is_some() {
+        if is_stats_leaf(not.arg(), key_expr) {
             let left = Arc::clone(not.arg());
             let right = Arc::new(phys_expr::NotExpr::new(Arc::clone(scalar_expr)));
             Ok((left, reverse_operator(op)?, right))
@@ -1437,9 +1432,19 @@ fn rewrite_cast_child_to_prunable(
     op: Operator,
     scalar_expr: &PhysicalExprRef,
     schema: &Schema,
+    key_expr: Option<&PhysicalExprRef>,
 ) -> Result<(PhysicalExprRef, Operator, PhysicalExprRef)> {
     verify_support_type_for_prune(&cast_child_expr.data_type(schema)?, cast_type)?;
-    rewrite_expr_to_prunable(cast_child_expr, op, scalar_expr, schema)
+    rewrite_expr_to_prunable(cast_child_expr, op, scalar_expr, schema, key_expr)
+}
+
+/// Whether `expr` is what statistics are read for: a column, or `key_expr`
+/// (an expression with its own statistics).
+fn is_stats_leaf(expr: &PhysicalExprRef, key_expr: Option<&PhysicalExprRef>) -> bool {
+    match key_expr {
+        Some(key_expr) => expr == key_expr,
+        None => expr.downcast_ref::<phys_expr::Column>().is_some(),
+    }
 }
 
 fn is_compare_op(op: Operator) -> bool {
@@ -7091,9 +7096,14 @@ mod tests {
         let left_input = logical2physical(&left_input, &schema);
         let right_input = lit(ScalarValue::Int32(Some(12)));
         let right_input = logical2physical(&right_input, &schema);
-        let (result_left, _, result_right) =
-            rewrite_expr_to_prunable(&left_input, Operator::Eq, &right_input, &schema)
-                .unwrap();
+        let (result_left, _, result_right) = rewrite_expr_to_prunable(
+            &left_input,
+            Operator::Eq,
+            &right_input,
+            &schema,
+            None,
+        )
+        .unwrap();
         assert_eq!(result_left.to_string(), left_input.to_string());
         assert_eq!(result_right.to_string(), right_input.to_string());
 
@@ -7102,9 +7112,14 @@ mod tests {
         let left_input = logical2physical(&left_input, &schema);
         let right_input = lit(ScalarValue::Decimal128(Some(12), 20, 3));
         let right_input = logical2physical(&right_input, &schema);
-        let (result_left, _, result_right) =
-            rewrite_expr_to_prunable(&left_input, Operator::Gt, &right_input, &schema)
-                .unwrap();
+        let (result_left, _, result_right) = rewrite_expr_to_prunable(
+            &left_input,
+            Operator::Gt,
+            &right_input,
+            &schema,
+            None,
+        )
+        .unwrap();
         // The rewrite rebuilds the cast with its nullable target field
         assert_eq!(result_left.to_string(), "CAST(a@0 AS Decimal128(20, 3);N)");
         assert_eq!(result_right.to_string(), right_input.to_string());
@@ -7114,9 +7129,14 @@ mod tests {
         let left_input = logical2physical(&left_input, &schema);
         let right_input = lit(ScalarValue::Int64(Some(12)));
         let right_input = logical2physical(&right_input, &schema);
-        let (result_left, _, result_right) =
-            rewrite_expr_to_prunable(&left_input, Operator::Gt, &right_input, &schema)
-                .unwrap();
+        let (result_left, _, result_right) = rewrite_expr_to_prunable(
+            &left_input,
+            Operator::Gt,
+            &right_input,
+            &schema,
+            None,
+        )
+        .unwrap();
         assert_eq!(result_left.to_string(), left_input.to_string());
         assert_eq!(result_right.to_string(), right_input.to_string());
 
@@ -7200,8 +7220,13 @@ mod tests {
         let left_input = logical2physical(&left_input, &schema);
         let right_input = lit(ScalarValue::Int64(Some(12)));
         let right_input = logical2physical(&right_input, &schema);
-        let result =
-            rewrite_expr_to_prunable(&left_input, Operator::Gt, &right_input, &schema);
+        let result = rewrite_expr_to_prunable(
+            &left_input,
+            Operator::Gt,
+            &right_input,
+            &schema,
+            None,
+        );
         assert!(result.is_err());
 
         // other expr
@@ -7209,8 +7234,13 @@ mod tests {
         let left_input = logical2physical(&left_input, &schema);
         let right_input = lit(ScalarValue::Int64(Some(12)));
         let right_input = logical2physical(&right_input, &schema);
-        let result =
-            rewrite_expr_to_prunable(&left_input, Operator::Gt, &right_input, &schema);
+        let result = rewrite_expr_to_prunable(
+            &left_input,
+            Operator::Gt,
+            &right_input,
+            &schema,
+            None,
+        );
         assert!(result.is_err());
         // TODO: add other negative test for other case and op
     }
@@ -7791,6 +7821,19 @@ mod tests {
         assert_eq!(
             predicate.predicate_expr().to_string(),
             "get_field(s@0, a)_null_count@1 != row_count@0"
+        );
+    }
+
+    #[test]
+    fn matched_expression_under_cast() {
+        use datafusion_functions::core::expr_fn::get_field;
+        // The schema adapter wraps a drifted struct field in a cast.
+        let expr = cast(get_field(col("s"), "a"), DataType::Float64).gt(lit(6.5));
+        let predicate = build_with_matcher(&expr, true);
+        assert_eq!(
+            predicate.predicate_expr().to_string(),
+            "get_field(s@0, a)_null_count@1 != row_count@2 \
+             AND CAST(get_field(s@0, a)_max@0 AS Float64;N) > 6.5"
         );
     }
 
