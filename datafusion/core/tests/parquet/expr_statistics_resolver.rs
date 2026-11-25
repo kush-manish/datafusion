@@ -21,6 +21,7 @@
 //! A bloom filter on `typed_value` cannot see values stored in `value`, and
 //! its validity check needs a second leaf, whose pages do not line up.
 
+use std::io::Write;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -31,7 +32,7 @@ use arrow::compute::nullif;
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::ParquetSource;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use datafusion_common::{DFSchema, Result, ScalarValue, internal_err};
 use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
 use datafusion_datasource::source::DataSourceExec;
@@ -44,12 +45,16 @@ use datafusion_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
     col, lit,
 };
-use datafusion_physical_expr::expressions::{Column, Literal};
+use datafusion_physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, Literal};
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::metrics::MetricValue;
+use futures::StreamExt;
 use parquet::arrow::ArrowWriter;
+use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataWriter};
 use parquet::file::properties::WriterProperties;
+use parquet::file::statistics::Statistics;
+use parquet::file::writer::TrackedWrite;
 use tempfile::NamedTempFile;
 
 use crate::parquet::utils::MetricsFinder;
@@ -242,6 +247,60 @@ async fn row_groups_pruned(register_resolver: bool) -> (usize, usize) {
     (pruning_metrics.pruned(), pruning_metrics.matched())
 }
 
+/// Scans the file with a dynamic filter that starts as `true`. After the
+/// first batch, the test sets the filter to `fake_variant_get(v, 'a') < 5`.
+/// Returns the `row_groups_pruned_dynamic_filter` count.
+async fn row_groups_pruned_dynamic(register_resolver: bool) -> usize {
+    let schema = shredded_schema();
+    let file = write_file(&schema);
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_batch_size(1));
+
+    let udf = ScalarUDF::from(FakeVariantGet(Signature::any(2, Volatility::Immutable)));
+    let df_schema = DFSchema::try_from(Arc::clone(&schema)).unwrap();
+    let column = ctx.create_physical_expr(col("v"), &df_schema).unwrap();
+    let filter = Arc::new(DynamicFilterPhysicalExpr::new(
+        vec![Arc::clone(&column)],
+        Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+    ));
+
+    let mut source = ParquetSource::new(Arc::clone(&schema))
+        .with_predicate(Arc::clone(&filter) as Arc<dyn PhysicalExpr>);
+    if register_resolver {
+        source = source.with_statistics_resolver(Arc::new(FakeVariantResolver));
+    }
+    let path = file.path().to_str().unwrap().to_string();
+    let size = std::fs::metadata(file.path()).unwrap().len();
+    let config =
+        FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), Arc::new(source))
+            .with_file(PartitionedFile::new(path, size))
+            .build();
+    let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(config);
+    let mut stream = plan.execute(0, ctx.task_ctx()).unwrap();
+    // The first batch comes from row group 0.
+    stream.next().await.unwrap().unwrap();
+    let predicate = udf.call(vec![col("v"), lit("a")]).lt(lit(5i64));
+    filter
+        .update(ctx.create_physical_expr(predicate, &df_schema).unwrap())
+        .unwrap();
+    while let Some(batch) = stream.next().await {
+        batch.unwrap();
+    }
+
+    let metrics = MetricsFinder::find_metrics(plan.as_ref()).unwrap();
+    metrics
+        .sum_by_name("row_groups_pruned_dynamic_filter")
+        .unwrap()
+        .as_usize()
+}
+
+#[tokio::test]
+async fn external_resolver_prunes_row_groups_with_a_dynamic_filter() {
+    // Row group 1 ([10, 11]) is pruned. Row group 2 is kept because one of
+    // its rows is not shredded.
+    assert_eq!(row_groups_pruned_dynamic(true).await, 1);
+    assert_eq!(row_groups_pruned_dynamic(false).await, 0);
+}
+
 #[tokio::test]
 async fn external_resolver_prunes_shredded_row_groups() {
     // Row group 0 is pruned. Row group 2 is kept because one of its rows
@@ -252,4 +311,84 @@ async fn external_resolver_prunes_shredded_row_groups() {
 #[tokio::test]
 async fn without_resolver_nothing_is_pruned() {
     assert_eq!(row_groups_pruned(false).await, (0, 3));
+}
+
+/// Writes `s: {a: Int64}` with rows `{a: 1}` and `{a: null}` in one row
+/// group. The footer keeps the min and max of `s.a`, but not its null count.
+fn struct_file_without_null_count() -> NamedTempFile {
+    let a = Field::new("a", DataType::Int64, true);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "s",
+        DataType::Struct(Fields::from(vec![a.clone()])),
+        true,
+    )]));
+    let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None]));
+    let s = StructArray::new(Fields::from(vec![a]), vec![values], None);
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(s)]).unwrap();
+    let mut bytes = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    let metadata = writer.close().unwrap();
+
+    let group = &metadata.row_groups()[0];
+    let column = group.column(0).clone();
+    let Statistics::Int64(stats) = column.statistics().unwrap() else {
+        panic!("expected Int64 statistics");
+    };
+    let stats = Statistics::int64(
+        stats.min_opt().copied(),
+        stats.max_opt().copied(),
+        None,
+        None,
+        false,
+    );
+    let column = column.into_builder().set_statistics(stats).build().unwrap();
+    let group = group
+        .clone()
+        .into_builder()
+        .set_column_metadata(vec![column])
+        .build()
+        .unwrap();
+    let metadata = ParquetMetaData::new(metadata.file_metadata().clone(), vec![group]);
+
+    // Replace the footer. The encoded rows and their offsets do not change.
+    let footer_len =
+        u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap());
+    bytes.truncate(bytes.len() - 8 - footer_len as usize);
+    let mut file = tempfile::Builder::new()
+        .suffix(".parquet")
+        .tempfile()
+        .unwrap();
+    let mut output = TrackedWrite::new(file.as_file_mut());
+    output.write_all(&bytes).unwrap();
+    ParquetMetaDataWriter::new_with_tracked(output, &metadata)
+        .finish()
+        .unwrap();
+    file
+}
+
+#[tokio::test]
+async fn missing_struct_field_null_count_keeps_row_group() {
+    // A missing null count is unknown, not zero. `s['a'] IS NULL` must not
+    // prune the row group.
+    let file = struct_file_without_null_count();
+    let ctx = SessionContext::new();
+    ctx.register_parquet(
+        "t",
+        file.path().to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await
+    .unwrap();
+    let batches = ctx
+        .sql("SELECT count(*) FROM t WHERE s['a'] IS NULL")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        ScalarValue::try_from_array(batches[0].column(0), 0).unwrap(),
+        ScalarValue::Int64(Some(1)),
+    );
 }
