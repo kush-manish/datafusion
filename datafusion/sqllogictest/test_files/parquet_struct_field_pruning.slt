@@ -197,6 +197,64 @@ Plan with Metrics
 statement ok
 DROP TABLE pages;
 
+# Dynamic TopK: 5 row groups of 3 rows, `s['a']` = 14 down to 0, so the
+# first row group holds the top 3. After it, the TopK filter
+# `s['a'] IS NULL OR s['a'] > 12` can skip the other 4 row groups.
+statement ok
+COPY (SELECT named_struct('a', 14 - value) AS s, 14 - value AS v FROM generate_series(0, 14))
+TO 'test_files/scratch/parquet_struct_field_pruning/topk.parquet'
+STORED AS PARQUET
+OPTIONS ('format.max_row_group_size' '3');
+
+statement ok
+CREATE EXTERNAL TABLE topk
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_struct_field_pruning/topk.parquet';
+
+statement ok
+set datafusion.execution.parquet.pushdown_filters = true;
+
+statement ok
+set datafusion.execution.target_partitions = 1;
+
+# `row_groups_pruned_dynamic_filter` is an uncategorized metric.
+statement ok
+set datafusion.explain.analyze_categories = 'rows,uncategorized';
+
+query I
+SELECT s['a'] FROM topk ORDER BY s['a'] DESC LIMIT 3;
+----
+14
+13
+12
+
+# The same query on a plain column, for comparison.
+query TT
+EXPLAIN ANALYZE SELECT v FROM topk ORDER BY v DESC LIMIT 3;
+----
+Plan with Metrics
+01)SortExec: TopK(fetch=3), expr=[v@0 DESC], preserve_partitioning=[false], filter=[v@0 IS NULL OR v@0 > 12], metrics=[output_rows=3]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_struct_field_pruning/topk.parquet]]}, projection=[v], file_type=parquet, predicate=DynamicFilter [ v@1 IS NULL OR v@1 > 12 ], sort_order_for_reorder=[v@0 DESC], reverse_row_groups=true, dynamic_rg_pruning=eligible, pruning_predicate=v_null_count@0 > 0 OR v_null_count@0 != row_count@2 AND v_max@1 > 12, required_guarantees=[], metrics=[output_rows=3, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=5 total → 5 matched, page_index_pages_pruned=0 total → 0 matched, limit_pruned_row_groups=0 total → 0 matched, row_groups_pruned_dynamic_filter=4, scan_efficiency_ratio=2.66% (73/2.75 K)]
+
+query TT
+EXPLAIN ANALYZE SELECT s['a'] FROM topk ORDER BY s['a'] DESC LIMIT 3;
+----
+Plan with Metrics
+01)SortExec: TopK(fetch=3), expr=[topk.s[a]@0 DESC], preserve_partitioning=[false], filter=[topk.s[a]@0 IS NULL OR topk.s[a]@0 > 12], metrics=[output_rows=3]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_struct_field_pruning/topk.parquet]]}, projection=[get_field(s@0, a) as topk.s[a]], file_type=parquet, predicate=DynamicFilter [ get_field(s@0, a) IS NULL OR get_field(s@0, a) > 12 ], dynamic_rg_pruning=eligible, metrics=[output_rows=3, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=5 total → 5 matched, page_index_pages_pruned=0 total → 0 matched, limit_pruned_row_groups=0 total → 0 matched, row_groups_pruned_dynamic_filter=0, scan_efficiency_ratio=14.08% (387/2.75 K)]
+
+statement ok
+reset datafusion.execution.parquet.pushdown_filters;
+
+statement ok
+set datafusion.execution.target_partitions = 4;
+
+statement ok
+set datafusion.explain.analyze_categories = 'rows';
+
+statement ok
+DROP TABLE topk;
+
 statement ok
 reset datafusion.explain.analyze_level;
 
