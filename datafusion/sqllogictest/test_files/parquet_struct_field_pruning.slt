@@ -452,3 +452,48 @@ reset datafusion.explain.analyze_level;
 
 statement ok
 reset datafusion.explain.analyze_categories;
+
+# A struct field can be NULL when the struct column itself is not
+# nullable. A row group is fully matched only if the field has no nulls.
+statement ok
+COPY (SELECT named_struct('a', column1) AS s, column2 AS id FROM (VALUES (1, 1), (CAST(NULL AS INT), 2), (3, 3)))
+TO 'test_files/scratch/parquet_struct_field_pruning/full_match/f.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE full_match STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_struct_field_pruning/full_match/f.parquet';
+
+statement ok
+set datafusion.execution.parquet.pushdown_filters = true;
+
+query I
+SELECT id FROM full_match WHERE s['a'] <= 5 ORDER BY id;
+----
+1
+2
+3
+
+statement ok
+set datafusion.execution.parquet.pushdown_filters = false;
+
+# A real column whose name looks like a statistics placeholder must not
+# take the bloom filter guarantees of a struct field.
+statement ok
+COPY (SELECT column1 AS "__datafusion_pruning_stats_expr_0", named_struct('a', column2) AS s FROM (VALUES (99, 7), (6, 8)))
+TO 'test_files/scratch/parquet_struct_field_pruning/placeholder/f.parquet'
+STORED AS PARQUET OPTIONS ('format.bloom_filter_on_write' 'true');
+
+statement ok
+CREATE EXTERNAL TABLE placeholder STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_struct_field_pruning/placeholder/f.parquet';
+
+query I
+SELECT count(*) FROM placeholder WHERE "__datafusion_pruning_stats_expr_0" = 99 AND s['a'] > 0;
+----
+0
+
+query I
+SELECT count(*) FROM placeholder WHERE s['a'] > 0 AND "__datafusion_pruning_stats_expr_0" IN (99, 100);
+----
+0
