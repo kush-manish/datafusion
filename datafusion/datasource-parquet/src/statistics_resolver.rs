@@ -14,8 +14,8 @@
 //!                                               ParquetLeafStatistics
 //! ```
 //!
-//! A resolver works on [`ParquetLeafStatistics`], which row group
-//! statistics implement.
+//! A resolver works on [`ParquetLeafStatistics`], so the same resolver serves
+//! row group statistics and the page index.
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -98,6 +98,21 @@ pub trait ParquetStatisticsResolver: Debug + Send + Sync {
         kind: ExprStatisticsKind,
         statistics: &dyn ParquetLeafStatistics,
     ) -> Option<ArrayRef>;
+
+    /// The Parquet leaf whose pages hold the values of `expr`, if page
+    /// index pruning can use this resolver.
+    ///
+    /// The page index prunes one leaf at a time, because the pages of
+    /// different leaves do not line up. Return `None` (the default) when the
+    /// statistics need more than one leaf.
+    fn page_index_leaf(
+        &self,
+        _expr: &Arc<dyn PhysicalExpr>,
+        _arrow_schema: &Schema,
+        _parquet_schema: &SchemaDescriptor,
+    ) -> Option<usize> {
+        None
+    }
 }
 
 /// The [`ParquetStatisticsResolver`]s of a Parquet scan.
@@ -154,6 +169,19 @@ impl ParquetStatisticsResolvers {
             .iter()
             .filter(|r| r.matches(expr))
             .find_map(|r| r.statistics(expr, kind, statistics))
+    }
+
+    /// The page index leaf that the first matching resolver reports.
+    pub(crate) fn page_index_leaf(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        arrow_schema: &Schema,
+        parquet_schema: &SchemaDescriptor,
+    ) -> Option<usize> {
+        self.resolvers
+            .iter()
+            .filter(|r| r.matches(expr))
+            .find_map(|r| r.page_index_leaf(expr, arrow_schema, parquet_schema))
     }
 }
 
@@ -246,5 +274,14 @@ impl ParquetStatisticsResolver for GetFieldStatisticsResolver {
             ExprStatisticsKind::Max => statistics.leaf_maxes(leaf, field),
             ExprStatisticsKind::NullCount => statistics.leaf_null_counts(leaf, field),
         }
+    }
+
+    fn page_index_leaf(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        arrow_schema: &Schema,
+        parquet_schema: &SchemaDescriptor,
+    ) -> Option<usize> {
+        Self::leaf(expr, arrow_schema, parquet_schema).map(|(leaf, _)| leaf)
     }
 }
