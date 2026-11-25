@@ -113,6 +113,26 @@ pub trait ParquetStatisticsResolver: Debug + Send + Sync {
     ) -> Option<usize> {
         None
     }
+
+    /// The Parquet leaf whose bloom filter can rule out values of `expr`.
+    ///
+    /// Return a leaf only when every non-null value of `expr` is stored in
+    /// that leaf, with the leaf's physical type. Then a value missing from
+    /// the leaf's bloom filter cannot be a value of `expr`. The literal is
+    /// hashed as its own type, so `expr` must have the type of the leaf
+    /// without any conversion.
+    ///
+    /// Return `None` (the default) otherwise. For example, a shredded
+    /// variant may store some values in its binary `value` column, which a
+    /// bloom filter on `typed_value` cannot see.
+    fn bloom_filter_leaf(
+        &self,
+        _expr: &Arc<dyn PhysicalExpr>,
+        _arrow_schema: &Schema,
+        _parquet_schema: &SchemaDescriptor,
+    ) -> Option<usize> {
+        None
+    }
 }
 
 /// The [`ParquetStatisticsResolver`]s of a Parquet scan.
@@ -169,6 +189,19 @@ impl ParquetStatisticsResolvers {
             .iter()
             .filter(|r| r.matches(expr))
             .find_map(|r| r.statistics(expr, kind, statistics))
+    }
+
+    /// The bloom filter leaf that the first matching resolver reports.
+    pub(crate) fn bloom_filter_leaf(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        arrow_schema: &Schema,
+        parquet_schema: &SchemaDescriptor,
+    ) -> Option<usize> {
+        self.resolvers
+            .iter()
+            .filter(|r| r.matches(expr))
+            .find_map(|r| r.bloom_filter_leaf(expr, arrow_schema, parquet_schema))
     }
 
     /// The page index leaf that the first matching resolver reports.
@@ -277,6 +310,16 @@ impl ParquetStatisticsResolver for GetFieldStatisticsResolver {
     }
 
     fn page_index_leaf(
+        &self,
+        expr: &Arc<dyn PhysicalExpr>,
+        arrow_schema: &Schema,
+        parquet_schema: &SchemaDescriptor,
+    ) -> Option<usize> {
+        Self::leaf(expr, arrow_schema, parquet_schema).map(|(leaf, _)| leaf)
+    }
+
+    /// A struct field leaf holds every non-null value of the field.
+    fn bloom_filter_leaf(
         &self,
         expr: &Arc<dyn PhysicalExpr>,
         arrow_schema: &Schema,

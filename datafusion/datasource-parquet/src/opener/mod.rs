@@ -1547,6 +1547,26 @@ impl RowGroupsPrunedParquetOpen {
                     ))
                 })
                 .collect::<Vec<_>>();
+            // Bloom filters for expressions such as struct fields, from the
+            // leaf that a statistics resolver names.
+            let parquet_exprs = predicate
+                .literal_exprs()
+                .into_iter()
+                .filter_map(|expr| {
+                    let parquet_schema = builder.parquet_schema();
+                    let leaf = prepared.statistics_resolvers.bloom_filter_leaf(
+                        &expr,
+                        &prepared.physical_file_schema,
+                        parquet_schema,
+                    )?;
+                    Some((
+                        expr,
+                        leaf,
+                        parquet_schema.column(leaf).physical_type(),
+                        parquet_schema.column(leaf).type_length(),
+                    ))
+                })
+                .collect::<Vec<_>>();
 
             let row_group_indexes: Vec<usize> =
                 self.row_groups.row_group_indexes().collect();
@@ -1591,6 +1611,37 @@ impl RowGroupsPrunedParquetOpen {
                     ) {
                         pruned = true;
                         break;
+                    }
+                }
+
+                for (expr, leaf, physical_type, type_length) in &parquet_exprs {
+                    if pruned {
+                        break;
+                    }
+                    let bf: Sbbf =
+                        match builder.get_row_group_column_bloom_filter(idx, *leaf).await
+                        {
+                            Ok(Some(bf)) => bf,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                debug!("Ignoring error reading bloom filter: {e}");
+                                prepared.file_metrics.predicate_evaluation_errors.add(1);
+                                continue;
+                            }
+                        };
+                    bloom_filter_stats.insert_for_expr(
+                        Arc::clone(expr),
+                        bf,
+                        *physical_type,
+                        *type_length,
+                    );
+                    if self.row_groups.prune_row_group_with_bloom_filters(
+                        idx,
+                        predicate,
+                        &bloom_filter_stats,
+                        &prepared.file_metrics,
+                    ) {
+                        pruned = true;
                     }
                 }
 
