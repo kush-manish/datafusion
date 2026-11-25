@@ -839,7 +839,7 @@ logical_plan
 physical_plan
 01)ProjectionExec: expr=[id@0 as id, __datafusion_extracted_2@1 as nullable_struct.s[label]]
 02)--FilterExec: __datafusion_extracted_1@0 IS NOT NULL, projection=[id@1, __datafusion_extracted_2@2]
-03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/nullable.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id, get_field(s@1, label) as __datafusion_extracted_2], file_type=parquet, predicate=get_field(s@1, value) IS NOT NULL
+03)----DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/nullable.parquet]]}, projection=[get_field(s@1, value) as __datafusion_extracted_1, id, get_field(s@1, label) as __datafusion_extracted_2], file_type=parquet, predicate=get_field(s@1, value) IS NOT NULL, pruning_predicate=get_field(s@1, value)_null_count@1 != row_count@0, required_guarantees=[]
 
 # Verify correctness
 query IT
@@ -2557,7 +2557,7 @@ physical_plan
 04)------SortExec: expr=[device@0 ASC NULLS LAST, timestamp@2 ASC NULLS LAST], preserve_partitioning=[false]
 05)--------ProjectionExec: expr=[__datafusion_extracted_1@0 as device, __datafusion_extracted_2@1 as user, timestamp@2 as timestamp]
 06)----------FilterExec: date@2 = 2025-01-03 AND __datafusion_extracted_1@0 IS NOT NULL AND __datafusion_extracted_1@0 !=  AND __datafusion_extracted_2@1 IS NOT NULL AND __datafusion_extracted_2@1 != , projection=[__datafusion_extracted_1@0, __datafusion_extracted_2@1, timestamp@3]
-07)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/events.parquet]]}, projection=[get_field(ids@2, id1) as __datafusion_extracted_1, get_field(structs@3, var1) as __datafusion_extracted_2, date, timestamp], file_type=parquet, predicate=date@0 = 2025-01-03 AND get_field(ids@2, id1) IS NOT NULL AND get_field(ids@2, id1) !=  AND get_field(structs@3, var1) IS NOT NULL AND get_field(structs@3, var1) != , pruning_predicate=date_null_count@2 != row_count@3 AND date_min@0 <= 2025-01-03 AND 2025-01-03 <= date_max@1 AND get_field(ids@2, id1)_null_count@6 != row_count@3 AND (get_field(ids@2, id1)_min@4 !=  OR  != get_field(ids@2, id1)_max@5) AND get_field(structs@3, var1)_null_count@9 != row_count@3 AND (get_field(structs@3, var1)_min@7 !=  OR  != get_field(structs@3, var1)_max@8), required_guarantees=[date in (2025-01-03)]
+07)------------DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/projection_pushdown/events.parquet]]}, projection=[get_field(ids@2, id1) as __datafusion_extracted_1, get_field(structs@3, var1) as __datafusion_extracted_2, date, timestamp], file_type=parquet, predicate=date@0 = 2025-01-03 AND get_field(ids@2, id1) IS NOT NULL AND get_field(ids@2, id1) !=  AND get_field(structs@3, var1) IS NOT NULL AND get_field(structs@3, var1) != , pruning_predicate=date_null_count@2 != row_count@3 AND date_min@0 <= 2025-01-03 AND 2025-01-03 <= date_max@1 AND get_field(ids@2, id1)_null_count@4 != row_count@3 AND get_field(ids@2, id1)_null_count@4 != row_count@3 AND (get_field(ids@2, id1)_min@5 !=  OR  != get_field(ids@2, id1)_max@6) AND get_field(structs@3, var1)_null_count@7 != row_count@3 AND get_field(structs@3, var1)_null_count@7 != row_count@3 AND (get_field(structs@3, var1)_min@8 !=  OR  != get_field(structs@3, var1)_max@9), required_guarantees=[date in (2025-01-03)]
 
 statement ok
 DROP TABLE events_pq;

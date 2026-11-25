@@ -241,7 +241,7 @@ EXPLAIN ANALYZE SELECT s['a'] FROM topk ORDER BY s['a'] DESC LIMIT 3;
 ----
 Plan with Metrics
 01)SortExec: TopK(fetch=3), expr=[topk.s[a]@0 DESC], preserve_partitioning=[false], filter=[topk.s[a]@0 IS NULL OR topk.s[a]@0 > 12], metrics=[output_rows=3]
-02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_struct_field_pruning/topk.parquet]]}, projection=[get_field(s@0, a) as topk.s[a]], file_type=parquet, predicate=DynamicFilter [ get_field(s@0, a) IS NULL OR get_field(s@0, a) > 12 ], dynamic_rg_pruning=eligible, metrics=[output_rows=3, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=5 total → 5 matched, page_index_pages_pruned=0 total → 0 matched, limit_pruned_row_groups=0 total → 0 matched, row_groups_pruned_dynamic_filter=0, scan_efficiency_ratio=14.08% (387/2.75 K)]
+02)--DataSourceExec: file_groups={1 group: [[WORKSPACE_ROOT/datafusion/sqllogictest/test_files/scratch/parquet_struct_field_pruning/topk.parquet]]}, projection=[get_field(s@0, a) as topk.s[a]], file_type=parquet, predicate=DynamicFilter [ get_field(s@0, a) IS NULL OR get_field(s@0, a) > 12 ], dynamic_rg_pruning=eligible, pruning_predicate=get_field(s@0, a)_null_count@0 > 0 OR get_field(s@0, a)_null_count@0 != row_count@2 AND get_field(s@0, a)_max@1 > 12, required_guarantees=[], metrics=[output_rows=3, files_ranges_pruned_statistics=1 total → 1 matched, row_groups_pruned_statistics=5 total → 5 matched, page_index_pages_pruned=0 total → 0 matched, limit_pruned_row_groups=0 total → 0 matched, row_groups_pruned_dynamic_filter=4, scan_efficiency_ratio=2.87% (79/2.75 K)]
 
 statement ok
 reset datafusion.execution.parquet.pushdown_filters;

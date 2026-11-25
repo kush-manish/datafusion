@@ -1102,26 +1102,6 @@ impl RequiredColumns {
     ) -> Result<Arc<dyn PhysicalExpr>> {
         self.stat_column_expr(column, column_expr, field, StatisticsType::Max)
     }
-
-    /// rewrite col --> col_null_count
-    fn null_count_column_expr(
-        &mut self,
-        column: &phys_expr::Column,
-        column_expr: &Arc<dyn PhysicalExpr>,
-        field: &Field,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        self.stat_column_expr(column, column_expr, field, StatisticsType::NullCount)
-    }
-
-    /// rewrite col --> col_row_count
-    fn row_count_column_expr(
-        &mut self,
-        column: &phys_expr::Column,
-        column_expr: &Arc<dyn PhysicalExpr>,
-        field: &Field,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        self.stat_column_expr(column, column_expr, field, StatisticsType::RowCount)
-    }
 }
 
 impl From<Vec<(phys_expr::Column, StatisticsType, Field)>> for RequiredColumns {
@@ -1601,47 +1581,57 @@ fn build_single_column_expr(
 /// thus can prune the row group / value
 fn build_is_null_column_expr(
     expr: &Arc<dyn PhysicalExpr>,
+    matcher: Option<&dyn StatisticsExprMatcher>,
     schema: &Schema,
     required_columns: &mut RequiredColumns,
     with_not: bool,
 ) -> Option<Arc<dyn PhysicalExpr>> {
-    if let Some(col) = expr.downcast_ref::<phys_expr::Column>() {
-        let field = schema.field_with_name(col.name()).ok()?;
-
-        let null_count_field = &Field::new(field.name(), DataType::UInt64, true);
-        if with_not {
-            if let Ok(row_count_expr) =
-                required_columns.row_count_column_expr(col, expr, null_count_field)
-            {
-                required_columns
-                    .null_count_column_expr(col, expr, null_count_field)
-                    .map(|null_count_column_expr| {
-                        // IsNotNull(column) => null_count != row_count
-                        Arc::new(phys_expr::BinaryExpr::new(
-                            null_count_column_expr,
-                            Operator::NotEq,
-                            row_count_expr,
-                        )) as _
-                    })
-                    .ok()
-            } else {
-                None
-            }
-        } else {
-            required_columns
-                .null_count_column_expr(col, expr, null_count_field)
-                .map(|null_count_column_expr| {
-                    // IsNull(column) => null_count > 0
-                    Arc::new(phys_expr::BinaryExpr::new(
-                        null_count_column_expr,
-                        Operator::Gt,
-                        Arc::new(phys_expr::Literal::new(ScalarValue::UInt64(Some(0)))),
-                    )) as _
-                })
-                .ok()
-        }
+    let key = as_stats_key(expr, matcher, schema)?;
+    let name = match &key.expr {
+        None => schema
+            .field_with_name(key.column.name())
+            .ok()?
+            .name()
+            .clone(),
+        Some(expr) => expr.to_string(),
+    };
+    let null_count_field = &Field::new(name, DataType::UInt64, true);
+    if with_not {
+        let row_count_expr = required_columns
+            .stat_key_expr(&key, expr, null_count_field, StatisticsType::RowCount)
+            .ok()?;
+        let null_count_expr = required_columns
+            .stat_key_expr(&key, expr, null_count_field, StatisticsType::NullCount)
+            .ok()?;
+        // IsNotNull(column) => null_count != row_count
+        Some(Arc::new(phys_expr::BinaryExpr::new(
+            null_count_expr,
+            Operator::NotEq,
+            row_count_expr,
+        )))
     } else {
-        None
+        let null_count_expr = required_columns
+            .stat_key_expr(&key, expr, null_count_field, StatisticsType::NullCount)
+            .ok()?;
+        // IsNull(column) => null_count > 0
+        Some(Arc::new(phys_expr::BinaryExpr::new(
+            null_count_expr,
+            Operator::Gt,
+            Arc::new(phys_expr::Literal::new(ScalarValue::UInt64(Some(0)))),
+        )))
+    }
+}
+
+/// Returns the [`StatsKey`] for `expr` if it is a column, or an expression
+/// that `matcher` gives its own statistics.
+fn as_stats_key(
+    expr: &Arc<dyn PhysicalExpr>,
+    matcher: Option<&dyn StatisticsExprMatcher>,
+    schema: &Schema,
+) -> Option<StatsKey> {
+    match expr.downcast_ref::<phys_expr::Column>() {
+        Some(column) => Some(StatsKey::column(column.clone())),
+        None => matched_stats_key(expr, matcher, schema),
     }
 }
 
@@ -1687,7 +1677,7 @@ fn min_max_non_null_exprs(
             None => column_expr,
         };
         let non_null =
-            build_is_null_column_expr(bare_expr, schema, required_columns, true)?;
+            build_is_null_column_expr(bare_expr, None, schema, required_columns, true)?;
         Some((min, max, non_null))
     })();
     if statistics.is_none() {
@@ -1951,6 +1941,7 @@ fn build_predicate_expression(
     if let Some(is_null) = expr.downcast_ref::<phys_expr::IsNullExpr>() {
         return build_is_null_column_expr(
             is_null.arg(),
+            ctx.statistics_expr_matcher,
             ctx.schema,
             required_columns,
             false,
@@ -1960,6 +1951,7 @@ fn build_predicate_expression(
     if let Some(is_not_null) = expr.downcast_ref::<phys_expr::IsNotNullExpr>() {
         return build_is_null_column_expr(
             is_not_null.arg(),
+            ctx.statistics_expr_matcher,
             ctx.schema,
             required_columns,
             true,
@@ -7784,6 +7776,22 @@ mod tests {
 
         // Without a matcher, nothing can be pruned.
         assert!(build_with_matcher(&expr, false).always_true());
+    }
+
+    #[test]
+    fn matched_expression_is_null() {
+        use datafusion_functions::core::expr_fn::get_field;
+        let a = || get_field(col("s"), "a");
+        let predicate = build_with_matcher(&a().is_null(), true);
+        assert_eq!(
+            predicate.predicate_expr().to_string(),
+            "get_field(s@0, a)_null_count@0 > 0"
+        );
+        let predicate = build_with_matcher(&a().is_not_null(), true);
+        assert_eq!(
+            predicate.predicate_expr().to_string(),
+            "get_field(s@0, a)_null_count@1 != row_count@0"
+        );
     }
 
     #[test]
