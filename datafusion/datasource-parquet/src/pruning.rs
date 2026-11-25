@@ -7,8 +7,9 @@
 use std::sync::Arc;
 
 use arrow::datatypes::Schema;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_expr::Operator;
-use datafusion_physical_expr::expressions::{BinaryExpr, IsNullExpr, NotExpr};
+use datafusion_physical_expr::expressions::{BinaryExpr, Column, IsNullExpr, NotExpr};
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprSimplifier};
 use datafusion_pruning::{PruningPredicate, PruningPredicateBuilder};
@@ -40,11 +41,34 @@ pub(crate) fn build_inverted_predicate(
             .then_with(|| a.name().cmp(b.name()))
     });
 
-    for column in columns {
+    // A matched expression such as `s['a']` can be NULL when its root column
+    // is not nullable, so every matched expression gets its own `IS NULL`.
+    let mut null_operands: Vec<Arc<dyn PhysicalExpr>> = columns
+        .into_iter()
+        .map(|column| Arc::new(column) as Arc<dyn PhysicalExpr>)
+        .collect();
+    if let Some(matcher) = predicate.statistics_expr_matcher() {
+        let mut keys: Vec<Arc<dyn PhysicalExpr>> = vec![];
+        predicate
+            .orig_expr()
+            .apply(|expr| {
+                if expr.downcast_ref::<Column>().is_none() && matcher.matches(expr) {
+                    if !keys.contains(expr) {
+                        keys.push(Arc::clone(expr));
+                    }
+                    return Ok(TreeNodeRecursion::Jump);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .ok()?;
+        null_operands.extend(keys);
+    }
+
+    for operand in null_operands {
         inverted_expr = Arc::new(BinaryExpr::new(
             inverted_expr,
             Operator::Or,
-            Arc::new(IsNullExpr::new(Arc::new(column))),
+            Arc::new(IsNullExpr::new(operand)),
         ));
     }
 

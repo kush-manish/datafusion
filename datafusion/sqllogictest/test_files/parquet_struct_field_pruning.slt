@@ -471,7 +471,6 @@ query I
 SELECT id FROM full_match WHERE s['a'] <= 5 ORDER BY id;
 ----
 1
-2
 3
 
 statement ok
