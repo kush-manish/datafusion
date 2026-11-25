@@ -1016,31 +1016,12 @@ impl RequiredColumns {
         }
     }
 
-    /// Rewrites column_expr so that all appearances of column
-    /// are replaced with a reference to either the min or max
-    /// statistics column, while keeping track that a reference to the statistics
-    /// column is required
+    /// Rewrites `column_expr` so that every appearance of `key` (a column,
+    /// or an expression with its own statistics) is replaced with a
+    /// reference to its `stat_type` statistics column, and records that the
+    /// statistics column is required.
     ///
-    /// for example, an expression like `col("foo") > 5`, when called
-    /// with Max would result in an expression like `col("foo_max") >
-    /// 5` with the appropriate entry noted in self.columns
-    fn stat_column_expr(
-        &mut self,
-        column: &phys_expr::Column,
-        column_expr: &Arc<dyn PhysicalExpr>,
-        field: &Field,
-        stat_type: StatisticsType,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        self.stat_key_expr(
-            &StatsKey::column(column.clone()),
-            column_expr,
-            field,
-            stat_type,
-        )
-    }
-
-    /// Like [`Self::stat_column_expr`], but for a [`StatsKey`], which is
-    /// either a column or an expression with its own statistics.
+    /// For example, `col("foo") > 5` with Max becomes `col("foo_max") > 5`.
     fn stat_key_expr(
         &mut self,
         key: &StatsKey,
@@ -1081,26 +1062,6 @@ impl RequiredColumns {
             None => rewrite_column_expr(Arc::clone(column_expr), column, &stat_column),
             Some(expr) => rewrite_stats_expr(Arc::clone(column_expr), expr, &stat_column),
         }
-    }
-
-    /// rewrite col --> col_min
-    fn min_column_expr(
-        &mut self,
-        column: &phys_expr::Column,
-        column_expr: &Arc<dyn PhysicalExpr>,
-        field: &Field,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        self.stat_column_expr(column, column_expr, field, StatisticsType::Min)
-    }
-
-    /// rewrite col --> col_max
-    fn max_column_expr(
-        &mut self,
-        column: &phys_expr::Column,
-        column_expr: &Arc<dyn PhysicalExpr>,
-        field: &Field,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        self.stat_column_expr(column, column_expr, field, StatisticsType::Max)
     }
 }
 
@@ -1664,30 +1625,39 @@ impl CompactInListDomain {
 
 /// Statistics expressions for `column`: its min, its max, and "not every row is
 /// NULL". Appends to `required_columns`, rolling the appends back if any part
-/// cannot be built, since [`RequiredColumns::stat_column_expr`] only appends.
+/// cannot be built, since [`RequiredColumns::stat_key_expr`] only appends.
 fn min_max_non_null_exprs(
-    column: &phys_expr::Column,
+    key: &StatsKey,
     column_expr: &Arc<dyn PhysicalExpr>,
     field: &Field,
+    matcher: Option<&dyn StatisticsExprMatcher>,
     schema: &Schema,
     required_columns: &mut RequiredColumns,
 ) -> Option<(PhysicalExprRef, PhysicalExprRef, PhysicalExprRef)> {
     let appended = required_columns.columns.len();
     let statistics = (|| {
         let min = required_columns
-            .min_column_expr(column, column_expr, field)
+            .stat_key_expr(key, column_expr, field, StatisticsType::Min)
             .ok()?;
         let max = required_columns
-            .max_column_expr(column, column_expr, field)
+            .stat_key_expr(key, column_expr, field, StatisticsType::Max)
             .ok()?;
         // A cast on `column_expr` (widening it towards min/max's target type)
-        // does not affect nullability, so check it on the bare column beneath.
-        let bare_expr = match column_expr.downcast_ref::<phys_expr::CastExpr>() {
-            Some(cast) => cast.expr(),
-            None => column_expr,
-        };
-        let non_null =
-            build_is_null_column_expr(bare_expr, None, schema, required_columns, true)?;
+        // does not affect nullability, so check it on the key beneath.
+        let key_expr = key.to_expr();
+        let bare_expr =
+            match (&key.expr, column_expr.downcast_ref::<phys_expr::CastExpr>()) {
+                (Some(_), _) => &key_expr,
+                (None, Some(cast)) => cast.expr(),
+                (None, None) => column_expr,
+            };
+        let non_null = build_is_null_column_expr(
+            bare_expr,
+            matcher,
+            schema,
+            required_columns,
+            true,
+        )?;
         Some((min, max, non_null))
     })();
     if statistics.is_none() {
@@ -1712,7 +1682,7 @@ fn build_hash_lookup_pruning_expr(
     };
     // The schema adapter often wraps the column in a same-type or widening cast
     // (a nullable table column over a REQUIRED file column, or a narrower file
-    // type). `stat_column_expr` rewrites only the inner `Column`, keeping it.
+    // type). `stat_key_expr` rewrites only the inner `Column`, keeping it.
     let column = match column_expr.downcast_ref::<phys_expr::CastExpr>() {
         Some(cast) => {
             let column = cast.expr().downcast_ref::<phys_expr::Column>()?;
@@ -1725,8 +1695,14 @@ fn build_hash_lookup_pruning_expr(
     if field.name() != column.name() {
         return None;
     }
-    let (min, max, non_null) =
-        min_max_non_null_exprs(column, column_expr, field, schema, required_columns)?;
+    let (min, max, non_null) = min_max_non_null_exprs(
+        &StatsKey::column(column.clone()),
+        column_expr,
+        field,
+        None,
+        schema,
+        required_columns,
+    )?;
     Some(Arc::new(phys_expr::BinaryExpr::new(
         non_null,
         Operator::And,
@@ -1751,6 +1727,7 @@ fn build_hash_lookup_pruning_expr(
 /// but prevents inversion from proving that a container is fully matched.
 fn build_compact_in_list_expr(
     in_list: &phys_expr::InListExpr,
+    matcher: Option<&dyn StatisticsExprMatcher>,
     schema: &Schema,
     required_columns: &mut RequiredColumns,
     properties: &mut PruningExpressionProperties,
@@ -1760,15 +1737,21 @@ fn build_compact_in_list_expr(
     } else {
         SetMembership::In
     };
-    let column = in_list.expr().downcast_ref::<phys_expr::Column>()?;
-    let field = schema.fields().get(column.index())?;
+    let key = as_stats_key(in_list.expr(), matcher, schema)?;
+    let field = match &key.expr {
+        None => {
+            let field = schema.fields().get(key.column.index())?;
+            if field.name() != key.column.name() {
+                return None;
+            }
+            field.as_ref().clone()
+        }
+        Some(expr) => Field::new(expr.to_string(), expr.data_type(schema).ok()?, true),
+    };
     let data_type = match field.data_type() {
         DataType::Dictionary(_, value) => value.as_ref(),
         data_type => data_type,
     };
-    if field.name() != column.name() {
-        return None;
-    }
     let mut domain = if data_type.is_string() {
         CompactInListDomain::String(Vec::with_capacity(in_list.list().len()))
     } else if matches!(
@@ -1810,8 +1793,14 @@ fn build_compact_in_list_expr(
             Some(false),
         ))));
     }
-    let (min, max, non_null) =
-        min_max_non_null_exprs(column, in_list.expr(), field, schema, required_columns)?;
+    let (min, max, non_null) = min_max_non_null_exprs(
+        &key,
+        in_list.expr(),
+        &field,
+        matcher,
+        schema,
+        required_columns,
+    )?;
     let may_match = match domain {
         CompactInListDomain::String(values) => {
             Arc::new(StringInListPruningExpr::new(membership, min, max, values))
@@ -1992,6 +1981,7 @@ fn build_predicate_expression(
             && in_list.list().len() <= ctx.max_in_list_size
             && let Some(pruning_expr) = build_compact_in_list_expr(
                 in_list,
+                ctx.statistics_expr_matcher,
                 ctx.schema,
                 required_columns,
                 properties,
@@ -7858,6 +7848,26 @@ mod tests {
         assert_eq!(
             predicate.predicate_expr().to_string(),
             "NOT get_field(s@0, flag)_min@0 OR NOT get_field(s@0, flag)_max@1"
+        );
+    }
+
+    #[test]
+    fn matched_expression_compact_in_list() {
+        use datafusion_functions::core::expr_fn::get_field;
+        let schema = struct_schema();
+        let list: Vec<Expr> = (30..51).map(lit).collect();
+        let expr = get_field(col("s"), "a").in_list(list, false);
+        let predicate = PruningPredicateBuilder::new()
+            .with_file_schema(Arc::clone(&schema))
+            .with_max_in_list_size(100)
+            .with_statistics_expr_matcher(Arc::new(GetFieldMatcher))
+            .try_build(logical2physical(&expr, &schema))
+            .unwrap();
+        // One compact check instead of 21 per-value comparisons.
+        assert_eq!(
+            predicate.predicate_expr().to_string(),
+            "get_field(s@0, a)_null_count@3 != row_count@2 AND \
+             IN_SET_INTERSECTS(get_field(s@0, a)_min@0, get_field(s@0, a)_max@1, 21 values)"
         );
     }
 
