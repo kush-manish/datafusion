@@ -1799,6 +1799,7 @@ fn min_max_non_null_exprs(
 /// and built once with the join's hash table.
 fn build_hash_lookup_pruning_expr(
     lookup: &HashTableLookupExpr,
+    matcher: Option<&dyn StatisticsExprMatcher>,
     schema: &Schema,
     required_columns: &mut RequiredColumns,
 ) -> Option<Arc<dyn PhysicalExpr>> {
@@ -1809,24 +1810,31 @@ fn build_hash_lookup_pruning_expr(
     };
     // The schema adapter often wraps the column in a same-type or widening cast
     // (a nullable table column over a REQUIRED file column, or a narrower file
-    // type). `stat_key_expr` rewrites only the inner `Column`, keeping it.
-    let column = match column_expr.downcast_ref::<phys_expr::CastExpr>() {
-        Some(cast) => {
-            let column = cast.expr().downcast_ref::<phys_expr::Column>()?;
-            let from = schema.fields().get(column.index())?.data_type();
-            cast.is_bigger_cast(from).then_some(column)?
+    // type). `stat_key_expr` rewrites only the key under it, keeping the cast.
+    let cast = column_expr.downcast_ref::<phys_expr::CastExpr>();
+    let key_expr = cast.map_or(column_expr, |cast| cast.expr());
+    let key = as_stats_key(key_expr, matcher, schema)?;
+    // The statistics have the type of the key itself, not of the cast.
+    let field = match &key.expr {
+        None => {
+            let field = schema.fields().get(key.column.index())?;
+            if field.name() != key.column.name() {
+                return None;
+            }
+            field.as_ref().clone()
         }
-        None => column_expr.downcast_ref::<phys_expr::Column>()?,
+        Some(expr) => Field::new(expr.to_string(), expr.data_type(schema).ok()?, true),
     };
-    let field = schema.fields().get(column.index())?;
-    if field.name() != column.name() {
+    if let Some(cast) = cast
+        && !cast.is_bigger_cast(field.data_type())
+    {
         return None;
     }
     let (min, max, non_null) = min_max_non_null_exprs(
-        &StatsKey::column(column.clone()),
+        &key,
         column_expr,
-        field,
-        None,
+        &field,
+        matcher,
         schema,
         required_columns,
     )?;
@@ -2150,8 +2158,13 @@ fn build_predicate_expression(
         }
     }
     if let Some(lookup) = expr.downcast_ref::<HashTableLookupExpr>() {
-        return build_hash_lookup_pruning_expr(lookup, ctx.schema, required_columns)
-            .unwrap_or_else(|| ctx.unhandled_hook.handle(expr));
+        return build_hash_lookup_pruning_expr(
+            lookup,
+            ctx.statistics_expr_matcher,
+            ctx.schema,
+            required_columns,
+        )
+        .unwrap_or_else(|| ctx.unhandled_hook.handle(expr));
     }
     // A partitioned hash join hides its per-partition filters under a `CASE` on the
     // repartition hash. A row takes exactly one branch, so a container may match
@@ -8153,6 +8166,27 @@ mod tests {
         // Containers 0 and 2 sit in the gap between 30 and 100000; container 1
         // holds 20. The bitmap excludes the first and third.
         assert_eq!(result, vec![false, true, false]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_hash_lookup_pruning_on_struct_field() -> Result<()> {
+        use datafusion_functions::core::expr_fn::get_field;
+        let s = DataType::Struct(vec![Field::new("a", DataType::Int64, true)].into());
+        let schema = Arc::new(Schema::new(vec![Field::new("s", s, true)]));
+        let key = logical2physical(&get_field(col("s"), "a"), &schema);
+        let lookup = hash_lookup(&key, &[10, 20, 30, 100_000])?;
+
+        let predicate = PruningPredicateBuilder::new()
+            .with_file_schema(Arc::clone(&schema))
+            .with_statistics_expr_matcher(Arc::new(GetFieldMatcher))
+            .try_build(lookup)?;
+        // The bitmap term reads the struct field's own statistics.
+        assert_eq!(
+            predicate.predicate_expr().to_string(),
+            "get_field(s@0, a)_null_count@3 != row_count@2 AND \
+             KEY_RANGE_BITMAP(get_field(s@0, a)_min@0, get_field(s@0, a)_max@1, 4/131072 buckets)"
+        );
         Ok(())
     }
 
