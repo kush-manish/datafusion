@@ -1896,14 +1896,17 @@ impl RowGroupsPrunedParquetOpen {
                         DynamicFilterTracking::Watching(_)
                     ) =>
                 {
-                    Some(RowGroupPruner::new(
-                        Arc::clone(predicate),
-                        Arc::clone(&prepared.physical_file_schema),
-                        Arc::clone(reader_metadata.metadata()),
-                        prepared.predicate_creation_errors.clone(),
-                        prepared.file_metrics.predicate_evaluation_errors.clone(),
-                        prepared.max_in_list_size,
-                    ))
+                    Some(
+                        RowGroupPruner::new(
+                            Arc::clone(predicate),
+                            Arc::clone(&prepared.physical_file_schema),
+                            Arc::clone(reader_metadata.metadata()),
+                            prepared.predicate_creation_errors.clone(),
+                            prepared.file_metrics.predicate_evaluation_errors.clone(),
+                            prepared.max_in_list_size,
+                        )
+                        .with_statistics_resolvers(prepared.statistics_resolvers.clone()),
+                    )
                 }
                 _ => None,
             };
