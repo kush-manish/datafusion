@@ -240,6 +240,7 @@ impl RowGroupPruner {
                 .map(Vec::as_slice),
             row_group_metadatas,
             arrow_schema: self.arrow_schema.as_ref(),
+            statistics_resolvers: Default::default(),
         };
 
         match pp.prune(&stats) {

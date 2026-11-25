@@ -21,6 +21,7 @@ use crate::push_decoder::{
     RowFilterContext, RowGroupPruner, RowGroupReverser,
 };
 use crate::row_group_filter::{RowGroupAccessPlanFilter, row_group_in_range};
+use crate::statistics_resolver::ParquetStatisticsResolvers;
 use crate::{
     Int96Coercer, ParquetAccessPlan, ParquetFileMetrics, ParquetFileReaderFactory,
     ParquetRowSelection, ParquetVirtualColumn, RowGroupAccess,
@@ -300,6 +301,8 @@ pub(super) struct ParquetMorselizer {
     /// Whether to also reverse the rows of each row group, making a reversed
     /// scan exactly ordered. Buffers one decoded row group at a time.
     pub reverse_rows: bool,
+    /// Statistics for expressions such as struct field accesses.
+    pub statistics_resolvers: ParquetStatisticsResolvers,
     /// Pool charged for the row group a `reverse_rows` scan buffers.
     pub memory_pool: Option<Arc<dyn MemoryPool>>,
     /// Optional sort order used to reorder row groups by their min/max statistics.
@@ -493,6 +496,7 @@ struct PreparedParquetOpen {
     row_group_range_assignment: RowGroupRangeAssignment,
     reverse_row_groups: bool,
     reverse_rows: bool,
+    statistics_resolvers: ParquetStatisticsResolvers,
     memory_pool: Option<Arc<dyn MemoryPool>>,
     sort_order_for_reorder: Option<LexOrdering>,
     preserve_order: bool,
@@ -1002,6 +1006,7 @@ impl ParquetMorselizer {
             row_group_range_assignment: self.row_group_range_assignment,
             reverse_row_groups: self.reverse_row_groups,
             reverse_rows: self.reverse_rows,
+            statistics_resolvers: self.statistics_resolvers.clone(),
             memory_pool: self.memory_pool.clone(),
             sort_order_for_reorder: self.sort_order_for_reorder.clone(),
             preserve_order: self.preserve_order,
@@ -1231,6 +1236,7 @@ impl MetadataLoadedParquetOpen {
             &physical_file_schema,
             &prepared.predicate_creation_errors,
             prepared.max_in_list_size,
+            &prepared.statistics_resolvers,
         );
 
         // Only build page pruning predicate if page index is enabled
@@ -1273,7 +1279,8 @@ impl FiltersPreparedParquetOpen {
             &prepared.file_name,
             &prepared.extensions,
             rg_metadata,
-        )?);
+        )?)
+        .with_statistics_resolvers(prepared.statistics_resolvers.clone());
 
         // If there is a range restricting what parts of the file to read
         if let Some(range) = prepared.file_range.as_ref() {
@@ -2115,12 +2122,14 @@ pub(crate) fn build_pruning_predicates(
     file_schema: &SchemaRef,
     predicate_creation_errors: &Count,
     max_in_list_size: usize,
+    statistics_resolvers: &ParquetStatisticsResolvers,
 ) -> Option<Arc<PruningPredicate>> {
     let predicate = predicate.as_ref()?;
     PruningPredicateBuilder::new()
         .with_file_schema(Arc::clone(file_schema))
         .with_error_counter(predicate_creation_errors)
         .with_max_in_list_size(max_in_list_size)
+        .with_statistics_expr_matcher(Arc::new(statistics_resolvers.clone()))
         .build(Arc::clone(predicate))
 }
 
@@ -2700,6 +2709,7 @@ mod test {
                 row_group_range_assignment: self.row_group_range_assignment,
                 reverse_row_groups: self.reverse_row_groups,
                 reverse_rows: self.reverse_rows,
+                statistics_resolvers: Default::default(),
                 memory_pool: self.memory_pool.clone(),
                 sort_order_for_reorder: None,
                 virtual_state,

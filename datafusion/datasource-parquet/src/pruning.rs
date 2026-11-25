@@ -50,9 +50,11 @@ pub(crate) fn build_inverted_predicate(
 
     let simplifier = PhysicalExprSimplifier::new(arrow_schema);
     let inverted_expr = simplifier.simplify(inverted_expr).ok()?;
-    PruningPredicateBuilder::new()
+    let mut builder = PruningPredicateBuilder::new()
         .with_file_schema(Arc::clone(predicate.schema()))
-        .with_max_in_list_size(predicate.max_in_list_size())
-        .try_build(inverted_expr)
-        .ok()
+        .with_max_in_list_size(predicate.max_in_list_size());
+    if let Some(matcher) = predicate.statistics_expr_matcher() {
+        builder = builder.with_statistics_expr_matcher(Arc::clone(matcher));
+    }
+    builder.try_build(inverted_expr).ok()
 }
